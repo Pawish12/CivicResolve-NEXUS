@@ -82,11 +82,59 @@ def event(db, incident, kind, actor, note, attachment=""):
     db.add(Event(incident_id=incident.id, kind=kind, actor=actor, note=note, attachment=attachment))
 
 
+def civic_memory_reference(incident):
+    """Return a verified prior incident code from an audited recurrence event, if any."""
+    for entry in incident.events:
+        if entry.kind == "recurrence":
+            match = re.search(r"CR-(\d{4,})", entry.note)
+            if match:
+                return f"CR-{match.group(1)}"
+    return None
+
+
+def recurrence_candidate(db, payload, classified_key):
+    """Flag likely repeat infrastructure problems without conflating new and resolved cases.
+
+    A different ward, department/category, nonmatching landmark, or a repair
+    verified more than 90 days ago is not enough evidence to link incidents.
+    This is a transparent heuristic, not causal root-cause diagnosis.
+    """
+    cutoff = now() - timedelta(days=90)
+    previous = db.scalars(
+        select(Incident).where(
+            Incident.ward == payload.ward,
+            Incident.category_key == classified_key,
+            Incident.status == "resolved",
+            Incident.updated_at >= cutoff,
+        ).order_by(Incident.updated_at.desc())
+    ).all()
+    for old in previous:
+        if not payload.location or not old.location:
+            continue  # A shared physical landmark is required to avoid false links.
+        if similarity(payload.location, old.location) < 0.52:
+            continue
+        if similarity(payload.description, old.description) < 0.48:
+            continue
+        return old
+    return None
+
+
+def apply_memory_bonus(priority, prior_code):
+    """Explain a capped recurrence review bonus without implying validated causality."""
+    if not prior_code:
+        return priority
+    value = min(100, priority["score"] + 10)
+    label = "Critical" if value >= 78 else "High" if value >= 60 else "Moderate" if value >= 40 else "Routine"
+    reasons = priority["reasons"][:-1] + ["Previously verified issue may have recurred: +10 (check root cause)", priority["reasons"][-1]]
+    return {"score": value, "label": label, "reasons": reasons}
+
+
 def show(incident, expanded=False):
     date = incident.created_at
     if date.tzinfo is None: date = date.replace(tzinfo=timezone.utc)
     elapsed = max(0, (now() - date).total_seconds() / 3600)
-    recalc = score(incident.description, incident.category_key, len(incident.reports), elapsed)
+    prior_code = civic_memory_reference(incident)
+    recalc = apply_memory_bonus(score(incident.description, incident.category_key, len(incident.reports), elapsed), prior_code)
     # Explicitly prefer the higher current risk as time elapses.
     data = {
         "id": incident.id,
@@ -111,6 +159,8 @@ def show(incident, expanded=False):
         "updated_at": dt_str(incident.updated_at),
         "signal_level": "Amplifying" if len(incident.reports)>=3 else "Emerging" if len(incident.reports)==2 else "Single report",
         "resolution_round": incident.resolution_round,
+        "recurrence_of": prior_code,
+        "root_cause_review": bool(prior_code),
     }
     if expanded:
         data["reports"] = [{"name":r.reporter_alias,"description":r.description,"date":dt_str(r.created_at)} for r in sorted(incident.reports,key=lambda x:x.created_at)]
@@ -167,7 +217,7 @@ def create_app(database_url=None, seed_demo=True):
             with SessionMaker() as db: seed(db)
         yield
         engine.dispose()
-    app = FastAPI(title="CivicResolve NEXUS",version="1.1.0",description="Impact-led civic incident intelligence with citizen-verified closure",lifespan=lifespan)
+    app = FastAPI(title="CivicResolve NEXUS",version="1.2.0",description="Impact-led civic incident intelligence with citizen-verified closure",lifespan=lifespan)
     # Sign sessions with a secret that persists between restarts in hosted mode.
     # In production configure SESSION_SECRET and DEMO_MODE=false.
     demo_mode = os.environ.get("DEMO_MODE", "true").lower() == "true"
@@ -234,7 +284,7 @@ def create_app(database_url=None, seed_demo=True):
     def home(): return FileResponse(ROOT / "static" / "index.html")
 
     @app.get("/api/health")
-    def health(): return {"status":"ok","service":"CivicResolve NEXUS","version":"1.1.0","mode":"demonstration" if demo_mode else "restricted"}
+    def health(): return {"status":"ok","service":"CivicResolve NEXUS","version":"1.2.0","mode":"demonstration" if demo_mode else "restricted"}
 
     @app.get("/api/meta")
     def metadata(): return {"wards":WARD_CHOICES,"features":["local_nlp_classification","incident_fusion","explainable_risk","citizen_verification","early_warning"]}
@@ -245,7 +295,7 @@ def create_app(database_url=None, seed_demo=True):
 
     @app.get("/api/incidents")
     def incidents(status:str="all", category:str="all", ward:str="all", q:str="", db:Session=Depends(db_session)):
-        items=db.scalars(select(Incident).options(selectinload(Incident.reports))).all()
+        items=db.scalars(select(Incident).options(selectinload(Incident.reports), selectinload(Incident.events))).all()
         data=[show(i) for i in items]
         if status!="all": data=[i for i in data if i['status']==status]
         if category!="all": data=[i for i in data if i['category_key']==category]
@@ -259,7 +309,7 @@ def create_app(database_url=None, seed_demo=True):
 
     @app.get("/api/overview")
     def overview(db:Session=Depends(db_session)):
-        items=db.scalars(select(Incident).options(selectinload(Incident.reports))).all()
+        items=db.scalars(select(Incident).options(selectinload(Incident.reports), selectinload(Incident.events))).all()
         data=[show(i) for i in items]
         active=[i for i in data if i['status']!="resolved"]
         cats={}; wards={}; statuses={}
@@ -270,7 +320,8 @@ def create_app(database_url=None, seed_demo=True):
         # Signal radar reports observations, not a predictive forecast.
         alerts=[{"incident":i,"reason":("Multiple independent reports are accumulating" if i['report_count']>=2 else "High-severity safety signal requires inspection")} for i in active if i['report_count']>=2 or i['priority']>=78]
         alerts.sort(key=lambda a:(-a['incident']['report_count'],-a['incident']['priority']))
-        return {"stats":{"incidents":len(data),"active":len(active),"voices":sum(i['report_count'] for i in data),"awaiting_verification":statuses.get('verification',0),"verified_fixes":statuses.get('resolved',0),"signal_clusters":sum(1 for i in active if i['report_count']>=2)},"categories":cats,"wards":wards,"statuses":statuses,"radar":alerts,"queue":sorted(active,key=lambda i:-i['priority'])[:6],"methodology":"Transparent rule-based safety score with capped report weighting; local ML suggests category. Scores are advisory, not validated emergency classifications."}
+        memory=[{"incident":i,"prior_code":i["recurrence_of"],"reason":"A new report resembles a previously citizen-verified fix in the same ward and landmark. Root-cause inspection recommended, not assumed."} for i in data if i["recurrence_of"]]
+        return {"stats":{"incidents":len(data),"active":len(active),"voices":sum(i['report_count'] for i in data),"awaiting_verification":statuses.get('verification',0),"verified_fixes":statuses.get('resolved',0),"signal_clusters":sum(1 for i in active if i['report_count']>=2),"recurrences_flagged":len(memory)},"categories":cats,"wards":wards,"statuses":statuses,"radar":alerts,"civic_memory":memory,"queue":sorted(active,key=lambda i:-i['priority'])[:6],"methodology":"Transparent rule-based safety score with capped report weighting; local ML suggests category. Recurrence adds at most +10 points for human review; it does not establish a common root cause."}
 
     @app.post("/api/complaints",status_code=201)
     def submit(payload:ComplaintIn,db:Session=Depends(db_session)):
@@ -293,13 +344,18 @@ def create_app(database_url=None, seed_demo=True):
             candidate.updated_at=now()
             id=candidate.id; merged=True
         else:
-            incident=Incident(title=payload.description[:95].rstrip(".")+".",description=payload.description,ward=payload.ward,location=payload.location,lat=payload.lat,lon=payload.lon,category_key=a['key'],category=a['category'],department=a['department'],confidence=a['confidence'],priority=a['score'],priority_label=a['label'],reasons_json=json.dumps(a['reasons']))
+            prior = recurrence_candidate(db, payload, a['key'])
+            prior_code = f"CR-{prior.id:04d}" if prior else None
+            reviewed = apply_memory_bonus(score(payload.description, a['key']), prior_code)
+            incident=Incident(title=payload.description[:95].rstrip(".")+".",description=payload.description,ward=payload.ward,location=payload.location,lat=payload.lat,lon=payload.lon,category_key=a['key'],category=a['category'],department=a['department'],confidence=a['confidence'],priority=reviewed['score'],priority_label=reviewed['label'],reasons_json=json.dumps(reviewed['reasons']))
             db.add(incident);db.flush()
             db.add(Report(incident_id=incident.id,reporter_alias=payload.name,description=payload.description))
             event(db,incident,"reported",payload.name,"New citizen report received; awaiting officer review")
+            if prior_code:
+                event(db, incident, "recurrence", "Civic Memory Intelligence", f"Possible recurrence of previously verified {prior_code}; matched category, ward, landmark and description. Check root cause in person.")
             id=incident.id;merged=False
         db.commit()
-        return {"incident_id":id,"code":f"CR-{id:04d}","merged":merged,"triage":a,"message":"Report linked to an existing civic incident" if merged else "New civic incident created"}
+        return {"incident_id":id,"code":f"CR-{id:04d}","merged":merged,"recurrence_of":prior_code if not merged else None,"triage":a,"message":"Report linked to an existing civic incident" if merged else "New civic incident created"}
 
     @app.post("/api/incidents/{incident_id}/support")
     def support(incident_id:int,payload:SupportIn,db:Session=Depends(db_session)):
@@ -364,6 +420,13 @@ def create_app(database_url=None, seed_demo=True):
         db.commit()
         return {"ok":True,"url":f"/uploads/{path.name}"}
 
+    @app.get("/api/memory")
+    def civic_memory(db:Session=Depends(db_session)):
+        """Public audit-backed repeat-issue indicators; not a causality predictor."""
+        incidents=db.scalars(select(Incident).options(selectinload(Incident.reports), selectinload(Incident.events))).all()
+        memory=[{"incident":show(i),"previous_code":civic_memory_reference(i)} for i in incidents if civic_memory_reference(i)]
+        return {"count":len(memory),"possible_recurrences":memory,"disclaimer":"A similarity-based alert for human investigation, not proof of a shared root cause."}
+
     @app.post("/api/assistant")
     def civic_guide(payload:AssistantIn,db:Session=Depends(db_session)):
         """Transparent context-aware service assistant; no external LLM or secret needed."""
@@ -374,6 +437,14 @@ def create_app(database_url=None, seed_demo=True):
             current = get_incident(db,payload.incident_id)
         else:
             current = None
+        if current and any(t in low for t in ("repeat", "recurring", "recurrence", "memory", "root cause")):
+            code=civic_memory_reference(current)
+            return {"intent":"civic_memory","answer":(f"{show(current)['code']} has a possible recurrence link to {code}. The system matched ward, category, landmark and wording after a previously verified fix. A field team should investigate the cause; a text match is not proof." if code else f"No prior verified case is currently linked to {show(current)['code']}. This does not rule out past problems outside the demo data."),"suggestions":["How is priority decided?","How is a fix verified?"]}
+        if any(t in low for t in ("repeat", "recurring", "recurrence", "memory", "root cause")):
+            rows=db.scalars(select(Incident).options(selectinload(Incident.reports),selectinload(Incident.events))).all()
+            found=[show(i) for i in rows if civic_memory_reference(i) and (payload.ward=='all' or i.ward==payload.ward)]
+            if not found: return {"intent":"civic_memory","answer":"Civic Memory has not flagged any possible recurring failures in this area yet. To test it, submit a new report resembling a previously citizen-verified incident in the same ward and landmark.","suggestions":["Show urgent cases","How do I report an issue?"]}
+            return {"intent":"civic_memory","answer":"Possible repeat issues for human root-cause review: "+"; ".join(f"{i['code']} may follow {i['recurrence_of']} in {i['ward']}" for i in found[:4])+". These are similarity alerts, not diagnoses.","suggestions":["Show urgent cases","How is priority decided?"]}
         if current and any(t in low for t in ("why", "priority", "score", "urgent", "critical")):
             d=show(current)
             return {"intent":"explain_priority", "answer":f"{d['code']} is {d['priority_label'].lower()} priority ({d['priority']}/100). " + "; ".join(d['priority_reasons'][:-1]) + ". The score supports human review, not an emergency determination.","suggestions":["How can I track a complaint?","How is a fix verified?"]}
@@ -393,7 +464,7 @@ def create_app(database_url=None, seed_demo=True):
             detail="; ".join(f"{i['code']} ({i['ward']}, {i['priority_label']} {i['priority']}/100, {i['report_count']} report(s))" for i in top)
             return {"intent":"radar", "answer":f"Based on currently reported incidents, the top {len(top)} cases to review are: {detail}. These are observation-based alerts, not forecasts. Officers should validate severity on the ground.","suggestions":["How is priority decided?","How can I track a complaint?"]}
         if any(t in low for t in ("score", "priority", "how decide", "fair", "bias", "logic")):
-            return {"intent":"methodology", "answer":"NEXUS uses an explainable score: service baseline + potential safety hazards (+23) + sensitive settings (+12) + urgency language (+8) + capped independent reports (up to +12) + waiting-time escalation (up to +20). Report count is capped so quieter neighbourhoods are not automatically deprioritized. Scores are advisory and may be reviewed by humans.","suggestions":["Show urgent cases","How is a fix verified?"]}
+            return {"intent":"methodology", "answer":"NEXUS uses an explainable score: service baseline + potential safety hazards (+23) + sensitive settings (+12) + urgency language (+8) + capped independent reports (up to +12) + waiting-time escalation (up to +20) + possible recurrence review (+10). Report count is capped so quieter neighbourhoods are not automatically deprioritized. Scores are advisory and may be reviewed by humans.","suggestions":["Show urgent cases","How is a fix verified?"]}
         if len(msg)>25 and any(t in low for t in ("water","road","pothole","street","garbage","drain","power","park","mosquito","pipe","leak","குப்பை","தண்ணீர்")):
             a=analyze(msg)
             return {"intent":"triage", "answer":f"Your description suggests {a['category']} → {a['department']}. Preliminary priority: {a['label']} ({a['score']}/100). Why: "+"; ".join(a['reasons'][:-1])+". This is a preliminary suggestion; use Report an Issue to submit it.","triage":a,"suggestions":["How do I report an issue?","Show urgent cases"]}

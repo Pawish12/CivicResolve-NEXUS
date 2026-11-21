@@ -19,6 +19,14 @@ Existing complaint portals can easily become collections of isolated tickets. A 
 
 The result is a demo with an explicit public-trust feedback loop, not simply an AI chatbot attached to a complaint form.
 
+## Civic Memory Intelligence (v1.2 upgrade)
+
+**New:** A new citizen report can be marked as a **possible recurrence** when it closely matches a previously **citizen-verified** issue in the same ward and landmark within 90 days. Instead of silently merging it into a closed ticket, CivicResolve creates a fresh incident, records an auditable link to the earlier resolution, and adds a **capped +10 advisory review bonus**. Signal Radar now includes a Civic Memory panel, and CivicGuide can explain the link. The inference is **not proof** that the underlying root cause is the same.
+
+Try it against the seeded demo case: report `Playground equipment in the public park was broken and dangerous for children.` at `Bharathi Park`, ward `Saibaba Colony` under a fresh alias. Open Signal Radar. The new report should mention the previous verified playground repair.
+
+This upgrade also adds a skip-navigation link, keyboard focus trapping/restoration for dialogs and more automated coverage. Public reporting and the existing officer workflow remain compatible; **no database schema migration** is needed.
+
 ## Novelty that judges can test
 
 | Capability | What makes it distinct | Demonstration |
@@ -150,11 +158,14 @@ Interactive Swagger/OpenAPI explorer: **http://localhost:8000/docs**. JSON schem
 
 ## Run tests
 
+GitHub Actions runs the same checks on each push to `main` (Python 3.12, JavaScript syntax, and repository pre-check).
+
+
 ```bash
 python -m pytest -q
 ```
 
-The integration suite exercises CRUD read paths, classification and priority rules, report fusion, staff-role and CSRF checks, unauthorized attempts, the complete assign→repair→dispute→reopen→confirm path, conversational assistant logic, upload format checks and validation. **8 tests passed** in the packaged development environment. If test tools are missing, install `pip install -r requirements-dev.txt` first.
+The integration suite exercises CRUD read paths, classification and priority rules, report fusion, staff-role and CSRF checks, unauthorized attempts, the complete assign→repair→dispute→reopen→confirm path, conversational assistant logic, upload format checks and validation. **17 automated tests passed** in the upgraded development environment. If test tools are missing, install `pip install -r requirements-dev.txt` first.
 
 ## Deployment
 
