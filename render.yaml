@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: civicresolve-nexus
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DEMO_MODE
+        value: "true"
+      - key: COOKIE_SECURE
+        value: "true"
+# For persistence, add DATABASE_URL for an external PostgreSQL database.
+# The free service filesystem is ephemeral, so demo data/uploads may reset.

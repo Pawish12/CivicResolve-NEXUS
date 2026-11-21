@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+*.sqlite
+*.sqlite3
+civicresolve.db
+civicresolve.db-*
+data/
+coverage/
+*.log
